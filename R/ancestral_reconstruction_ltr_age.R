@@ -2,7 +2,7 @@
 
 # ancestral_reconstruction_ltr_age.R
 #
-# For each tip taxon, run summary_stats.py on column 7 from:
+# For each tip taxon, run summary_stats.py on the p-distance column of:
 #   <taxon><suffix>
 # Then reconstruct ancestral totals + per-bin counts at internal nodes via fastAnc.
 #
@@ -31,6 +31,7 @@
 #   --tree_pdf FILE       default: tree_with_node_ids.pdf
 #   --node_map FILE       default: node_map.tsv
 #   --max_tips_sig INT    number of tips to show in signature (default 6)
+#   --pdist_col COL       p-distance column: name (needs a header) or 1-based index
 
 suppressPackageStartupMessages({
   library(ape)
@@ -48,6 +49,8 @@ default_python_cmd  <- "python"
 default_tree_pdf    <- "tree_with_node_ids.pdf"
 default_node_map    <- "node_map.tsv"
 default_max_tips_sig <- 6
+default_pdist_col   <- "p_dist"   # column name, used when the file has a header
+default_pdist_idx   <- 18         # 1-based fallback when the file has no header
 
 totals_outfile <- "ancestral_summary_totals.tsv"
 bins_outfile   <- "ancestral_summary_bins.tsv"
@@ -62,7 +65,7 @@ print_usage_and_exit <- function(exit_code = 0) {
                                      [--bins INT] [--bin_max NUM]
                                      [--python CMD]
                                      [--tree_pdf FILE] [--node_map FILE]
-                                     [--max_tips_sig INT]
+                                     [--max_tips_sig INT] [--pdist_col COL]
 
 Required inputs:
   --newick FILE
@@ -103,6 +106,12 @@ Optional:
   --max_tips_sig INT
       How many tips to include in the short clade signature.
       Default: 6
+
+  --pdist_col COL
+      Which column of the results file holds the p-distance. Either a column
+      name (matched against the header line, with or without a leading '#')
+      or a 1-based column number for files with no header.
+      Default: p_dist, falling back to column 18 in headerless files.
 ", sep = ""
   )
   quit(status = exit_code)
@@ -129,6 +138,7 @@ python_cmd     <- get_arg_value("--python",       args, default_python_cmd)
 tree_pdf_file  <- get_arg_value("--tree_pdf",     args, default_tree_pdf)
 node_map_file  <- get_arg_value("--node_map",     args, default_node_map)
 max_tips_sig   <- as.integer(get_arg_value("--max_tips_sig", args, as.character(default_max_tips_sig)))
+pdist_col      <- get_arg_value("--pdist_col",  args, default_pdist_col)
 
 if (is.na(bins) || bins <= 0) stop("--bins must be a positive integer.")
 if (is.na(bin_max) || bin_max <= 0) stop("--bin_max must be a positive number.")
@@ -300,6 +310,27 @@ run_summary_stats_for_values <- function(values,
   list(total_read = total_read, total_used = total_used, bins = bins_df)
 }
 
+## ------------------------ 2b. p-distance column resolution -----------------
+
+# spec is either a 1-based column number or a column name looked up in `header`
+# (NULL when the file has no header line).
+resolve_pdist_col <- function(spec, header, file) {
+  n <- suppressWarnings(as.integer(spec))
+  if (!is.na(n)) {
+    if (n < 1) stop("--pdist_col must be a positive column number, got: ", spec)
+    return(n)
+  }
+  if (!is.null(header)) {
+    j <- match(spec, sub("^#", "", header))
+    if (!is.na(j)) return(j)
+    stop("Column '", spec, "' not found in the header of ", file,
+         ". Available: ", paste(header, collapse = ", "))
+  }
+  if (identical(spec, default_pdist_col)) return(default_pdist_idx)
+  stop("File ", file, " has no header, so '", spec,
+       "' cannot be matched by name. Pass --pdist_col as a column number.")
+}
+
 ## ------------------------ 3. Run summary_stats.py for each tip --------------
 
 stats_by_species <- list()
@@ -314,25 +345,44 @@ for (sp in tip_species) {
 
   cat("Reading values for", sp, "from", res_file, "...\n")
 
-  df <- tryCatch({
-    # Result files carry a '#'-prefixed header line (e.g. "#name<TAB>LTR_len<TAB>...").
-    # We cannot use comment.char="#" to skip it because the name column contains a
-    # '#' mid-field (e.g. "CP094635.1:4318-9747#LTR/Copia/Ale"), which would be
-    # truncated. Instead drop only lines that START with '#', then parse the rest.
+  parsed <- tryCatch({
+    # Result files may carry a header line, usually '#'-prefixed
+    # (e.g. "#seq_id<TAB>seq_len<TAB>..."). We cannot use comment.char="#" to skip
+    # it because the name column contains a '#' mid-field (e.g.
+    # "CP094635.1:4318-9747#LTR/Copia/Ale"), which would be truncated. Instead
+    # detect the header explicitly, then parse the remaining lines.
     lines <- readLines(res_file)
+    lines <- lines[nzchar(lines)]
+    if (length(lines) == 0) stop("File is empty")
+    header <- NULL
+    first <- strsplit(sub("^#", "", lines[1]), "\t")[[1]]
+    # A header either starts with '#' or has no numeric field at all.
+    if (startsWith(lines[1], "#") ||
+        !any(is.finite(suppressWarnings(as.numeric(first))))) {
+      header <- trimws(first)
+      lines <- lines[-1]
+    }
     lines <- lines[!startsWith(lines, "#")]
-    read.table(text = lines, header = FALSE, sep = "\t", comment.char = "", quote = "", stringsAsFactors = FALSE)
+    list(
+      header = header,
+      df = read.table(text = lines, header = FALSE, sep = "\t", comment.char = "", quote = "", stringsAsFactors = FALSE)
+    )
   },
     error = function(e) stop("Error reading ", res_file, ": ", conditionMessage(e))
   )
 
-  if (ncol(df) < 7) stop("File ", res_file, " has fewer than 7 columns.")
+  df  <- parsed$df
+  idx <- resolve_pdist_col(pdist_col, parsed$header, res_file)
 
-  values <- as.numeric(df[[7]])
+  if (ncol(df) < idx) {
+    stop("File ", res_file, " has only ", ncol(df), " columns; need column ", idx, ".")
+  }
+
+  values <- as.numeric(df[[idx]])
   values <- values[is.finite(values)]
-  if (length(values) == 0) stop("No numeric values in column 7 of ", res_file)
+  if (length(values) == 0) stop("No numeric values in column ", idx, " of ", res_file)
 
-  cat("  -> ", length(values), " values read from column 7.\n", sep = "")
+  cat("  -> ", length(values), " values read from column ", idx, ".\n", sep = "")
 
   stats <- run_summary_stats_for_values(
     values       = values,
